@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# Wrapper that picks the right fix for a game automatically, using Discord's list
+# of detectable games. Runs the game unchanged if the game isn't in the list.
+#
+# Steam launch options:  discord-auto %command%
+# Other launchers:       discord-auto --app <game name or Discord app id> -- <command> [args...]
+import json
+import os
+import shlex
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+URL = "https://discord.com/api/v9/applications/detectable"
+CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "linux-discord-game-detection-fix",
+    "detectable.json",
+)
+# How long to look for the game's process, and how big it must be to count as the game
+# rather than a launcher or helper.
+WAIT_SECONDS = 180
+MIN_RSS = 100 * 1024 * 1024
+# Windows programs that Wine/Proton or launchers start next to the game.
+WINE_HELPERS = {
+    "conhost.exe", "crashpad_handler.exe", "crashreportclient.exe", "explorer.exe",
+    "iexplore.exe", "mscorsvw.exe", "plugplay.exe", "rpcss.exe", "rundll32.exe",
+    "services.exe", "start.exe", "steam.exe", "steamwebhelper.exe", "svchost.exe",
+    "tabtip.exe", "unitycrashhandler32.exe", "unitycrashhandler64.exe", "wineboot.exe",
+    "winedevice.exe", "winemenubuilder.exe",
+}
+
+
+def log(msg):
+    print(f"discord-auto: {msg}", file=sys.stderr)
+
+
+def load_games():
+    """Discord's detectable games list, re-downloaded once a day. Never fails."""
+    if not os.path.exists(CACHE) or time.time() - os.path.getmtime(CACHE) > 86400:
+        try:
+            req = urllib.request.Request(URL, headers={"User-Agent": "linux-discord-game-detection-fix"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = r.read()
+            json.loads(data)
+            os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+            with open(CACHE + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(CACHE + ".tmp", CACHE)
+        except (OSError, ValueError) as e:
+            log(f"couldn't download Discord's game list ({e}), using the old copy if there is one")
+    try:
+        with open(CACHE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def find_game(games, wanted, steam_id):
+    if wanted:
+        w = wanted.lower()
+        for g in games:
+            names = [g.get("name", "")] + (g.get("aliases") or [])
+            if g["id"] == wanted or w in (n.lower() for n in names):
+                return g
+        return None
+    for g in games:
+        for sku in g.get("third_party_skus") or []:
+            if sku.get("distributor") == "steam" and sku.get("id") == steam_id:
+                return g
+    return None
+
+
+def read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def processes():
+    """Yield (pid, parent pid, resident memory in bytes) for every process."""
+    page = os.sysconf("SC_PAGE_SIZE")
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            stat = read(f"/proc/{entry}/stat")
+            # The process name is in brackets and may contain spaces, so split after it.
+            fields = stat[stat.rfind(b")") + 2:].split()
+            if len(fields) > 21:
+                yield int(entry), int(fields[1]), int(fields[21]) * page
+
+
+def is_game(pid, wine):
+    if wine:
+        # Wine processes run a wine binary, with the Windows path as the first argument.
+        try:
+            exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            return False
+        arg0 = read(f"/proc/{pid}/cmdline").split(b"\0")[0].decode(errors="replace")
+        name = arg0.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        return exe.startswith("wine") and name.endswith(".exe") and name not in WINE_HELPERS
+    return True
+
+
+def find_game_process(root, wine):
+    """The largest process in `root`'s tree (itself included) that looks like the game."""
+    procs = list(processes())
+    children = {}
+    for pid, ppid, _ in procs:
+        children.setdefault(ppid, []).append(pid)
+    family, todo = {root}, [root]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            if child not in family:
+                family.add(child)
+                todo.append(child)
+    best = None
+    for pid, _, rss in procs:
+        if pid in family and rss >= MIN_RSS and (best is None or rss > best[1]) and is_game(pid, wine):
+            best = (pid, rss)
+    return best and best[0]
+
+
+def start_presence(app_id, wine):
+    """In the background, find the game's process and link it to the official app."""
+    root = os.getpid()  # becomes the game's command after exec
+    child = os.fork()
+    if child:
+        os.waitpid(child, 0)
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline and os.path.exists(f"/proc/{root}"):
+        pid = find_game_process(root, wine)
+        if pid:
+            presence = os.path.join(HERE, "discord-presence")
+            os.execv(presence, [presence, app_id, str(pid)])
+        time.sleep(2)
+    os._exit(0)
+
+
+def main():
+    args = sys.argv[1:]
+    wanted = None
+    if args[:1] == ["--app"]:
+        if len(args) < 4 or args[2] != "--":
+            sys.exit("usage: discord-auto %command%\n"
+                     "       discord-auto --app <game name or Discord app id> -- <command> [args...]")
+        wanted, args = args[1], args[3:]
+    if not args:
+        sys.exit("usage: discord-auto %command%")
+
+    steam_id = os.environ.get("SteamAppId", "")
+    game = None
+    if wanted or steam_id not in ("", "0"):
+        game = find_game(load_games(), wanted, steam_id)
+    if not game:
+        log("game not found in Discord's list, running it without changes")
+        os.execvp(args[0], args)
+
+    exes = game.get("executables") or []
+    windows_exes = [e for e in exes if e.get("os") == "win32"]
+    wine = any(os.path.basename(a) in ("proton", "wine", "wine64") or a.lower().endswith(".exe") for a in args)
+
+    if any(e.get("os") == "linux" for e in exes) or (wine and windows_exes):
+        # Discord can already match this game by itself.
+        log(f"{game['name']}: Discord detects this game without help")
+        os.execvp(args[0], args)
+    if windows_exes:
+        # Native Linux game that Discord only knows by its Windows .exe.
+        e = windows_exes[0]
+        name = e["name"].lstrip(">")
+        extra = shlex.split(e["arguments"]) if e.get("arguments") else []
+        log(f"{game['name']}: running next to a stand-in process named {name}")
+        fake = os.path.join(HERE, "discord-fake-process")
+        os.execv(fake, [fake, name, *extra, "--", *args])
+    # No executables listed: tell Discord which process is this game.
+    log(f"{game['name']}: will link the game's process to Discord app {game['id']}")
+    start_presence(game["id"], wine)
+    os.execvp(args[0], args)
+
+
+if __name__ == "__main__":
+    main()
