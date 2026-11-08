@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+# Holds a Discord Rich Presence connection for an application id until the
+# watched PID exits, so Discord shows that official app as "Playing".
+# Passing the game's own PID makes Discord merge it with the detected process
+# instead of showing a second activity.
+#
+# Usage: discord-presence <client_id> <pid>
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import time
+
+
+def connect():
+    run = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    for i in range(10):
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.connect(f"{run}/discord-ipc-{i}")
+            return s
+        except OSError:
+            s.close()
+    return None
+
+
+def send(s, op, payload):
+    data = json.dumps(payload).encode()
+    s.sendall(struct.pack("<ii", op, len(data)) + data)
+
+
+def recv(s):
+    op, length = struct.unpack("<ii", s.recv(8, socket.MSG_WAITALL))
+    return op, json.loads(s.recv(length, socket.MSG_WAITALL))
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit("usage: discord-presence <client_id> <pid>")
+    with open("/proc/self/comm", "w") as f:
+        f.write("discord-presence")
+    client_id, pid = sys.argv[1], int(sys.argv[2])
+    start = int(time.time())
+    while alive(pid):
+        s = connect()
+        if not s:
+            time.sleep(5)
+            continue
+        try:
+            send(s, 0, {"v": 1, "client_id": client_id})
+            recv(s)
+            send(s, 1, {
+                "cmd": "SET_ACTIVITY",
+                "args": {"pid": pid, "activity": {"timestamps": {"start": start}}},
+                "nonce": str(start),
+            })
+            recv(s)
+            pidfd = os.pidfd_open(pid)
+            while True:
+                ready, _, _ = select.select([pidfd, s], [], [])
+                if pidfd in ready:
+                    return
+                if not s.recv(4096):
+                    break
+        except (OSError, struct.error, ValueError):
+            pass
+        finally:
+            s.close()
+        time.sleep(5)
+
+
+main()

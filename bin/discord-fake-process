@@ -1,0 +1,47 @@
+#!/bin/bash
+# Run a command next to a dummy process with a chosen executable name, so Discord's
+# process scanner matches it to an official game entry. The dummy exits with the command.
+#
+# Usage: discord-fake-process <exe-name> [dummy args...] -- <command> [args...]
+#   exe-name may contain directories for entries that match on a path suffix,
+#   e.g. "gnomoria/gnomoria.exe".
+set -e
+
+usage() {
+    echo "usage: $(basename "$0") <exe-name> [dummy args...] -- <command> [args...]" >&2
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+name=$1
+shift
+args=()
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+    args+=("$1")
+    shift
+done
+[ "${1:-}" = "--" ] || usage
+shift
+[ $# -gt 0 ] || usage
+
+here=$(dirname "$(readlink -f "$0")")
+idle=
+for candidate in "${LDGDF_IDLE:-}" "$here/../libexec/linux-discord-game-detection-fix/idle" "$here/../build/idle"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        idle=$candidate
+        break
+    fi
+done
+if [ -z "$idle" ]; then
+    echo "$(basename "$0"): idle binary not found, run 'make' first" >&2
+    exit 1
+fi
+
+# Discord reads the real executable path, so this must be a copy, not a symlink.
+fake="${XDG_DATA_HOME:-$HOME/.local/share}/linux-discord-game-detection-fix/fake/$name"
+mkdir -p "$(dirname "$fake")"
+cmp -s "$idle" "$fake" || install -m755 "$idle" "$fake"
+
+# The dummy watches this PID, which becomes the command after exec.
+"$fake" $$ "${args[@]}" </dev/null >/dev/null 2>&1 &
+exec "$@"

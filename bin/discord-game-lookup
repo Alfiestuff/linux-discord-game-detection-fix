@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+# Look up games in Discord's detectable games list and suggest which fix to use.
+#
+# Usage: discord-game-lookup <name>          search by game name
+#        discord-game-lookup --exe <file>    search by executable name
+#        discord-game-lookup --steam <appid> search by Steam app id
+#        add --refresh to re-download the list (it is cached for a day)
+import argparse
+import json
+import os
+import shlex
+import sys
+import time
+import urllib.request
+
+URL = "https://discord.com/api/v9/applications/detectable"
+CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "linux-discord-game-detection-fix",
+    "detectable.json",
+)
+
+
+def load(refresh):
+    if refresh or not os.path.exists(CACHE) or time.time() - os.path.getmtime(CACHE) > 86400:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        req = urllib.request.Request(URL, headers={"User-Agent": "linux-discord-game-detection-fix"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        with open(CACHE, "wb") as f:
+            f.write(data)
+    with open(CACHE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def matches(app, args):
+    if args.exe:
+        want = args.exe.lower()
+        return any(
+            e.get("name", "").lstrip(">").lower().split("/")[-1] == want
+            for e in app.get("executables") or []
+        )
+    if args.steam:
+        return any(
+            s.get("distributor") == "steam" and s.get("id") == args.steam
+            for s in app.get("third_party_skus") or []
+        )
+    query = args.name.lower()
+    return query in app.get("name", "").lower() or any(query in a.lower() for a in app.get("aliases") or [])
+
+
+def suggestion(app):
+    exes = app.get("executables") or []
+    if any(e.get("os") == "linux" for e in exes):
+        return "has a native Linux entry, so detection should already work (check Discord isn't a Flatpak)"
+    for e in exes:
+        if e.get("os") == "win32":
+            name = e["name"].lstrip(">")
+            dummy = shlex.split(e["arguments"]) if e.get("arguments") else []
+            return "discord-fake-process " + shlex.join([name, *dummy]) + " -- <command>"
+    return f"no executables listed; use: steam-discord {app['id']} <process name> %command%"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("name", nargs="?")
+    p.add_argument("--exe")
+    p.add_argument("--steam")
+    p.add_argument("--refresh", action="store_true")
+    args = p.parse_args()
+    if not (args.name or args.exe or args.steam):
+        p.error("give a name, --exe or --steam")
+
+    found = [a for a in load(args.refresh) if matches(a, args)]
+    if not found:
+        sys.exit("no matches")
+    for app in found[:25]:
+        steam = ", ".join(s["id"] for s in app.get("third_party_skus") or [] if s.get("distributor") == "steam")
+        print(f"{app['name']}  (id {app['id']})")
+        print(f"  steam app id: {steam or '-'}")
+        for e in app.get("executables") or []:
+            extra = f"  args: {e['arguments']}" if e.get("arguments") else ""
+            print(f"  {e.get('os', '?'):7} {e.get('name')}{extra}")
+        print(f"  fix: {suggestion(app)}")
+        print()
+    if len(found) > 25:
+        print(f"... {len(found) - 25} more, narrow the search")
+
+
+main()

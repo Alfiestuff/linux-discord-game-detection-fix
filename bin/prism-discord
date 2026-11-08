@@ -1,0 +1,5 @@
+#!/bin/bash
+# Prism Launcher wrapper command so Discord shows the official Minecraft game.
+# Set it in Settings > Custom commands > Wrapper command.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/discord-fake-process" javaw.exe net.minecraft.client.main.Main -- "$@"

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Launch Sober (Flatpak) so Discord shows the official ROBLOX game.
+here=$(dirname "$(readlink -f "$0")")
+exec "$here/discord-fake-process" RobloxPlayerBeta.exe -- \
+    flatpak run --branch=stable --arch=x86_64 --command=sober --file-forwarding org.vinegarhq.Sober -- @@u "$@" @@

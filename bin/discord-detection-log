@@ -1,0 +1,12 @@
+#!/bin/bash
+# Follow Discord's log and print which game it currently treats as "Playing",
+# with the executable it matched. Useful for checking a fix without restarting Discord.
+#
+# Usage: discord-detection-log [path to renderer_js.log]
+log=${1:-${XDG_CONFIG_HOME:-$HOME/.config}/discord/logs/renderer_js.log}
+if [ ! -f "$log" ]; then
+    echo "$(basename "$0"): log not found: $log" >&2
+    exit 1
+fi
+tail -n 0 -F "$log" | grep --line-buffered -a 'visibleGame=' |
+    sed -u -E 's/^\[([^]]*)\].*visibleGame=(.*) newPrimaryKey=([^ ]*).*/\1  \2  (\3)/'

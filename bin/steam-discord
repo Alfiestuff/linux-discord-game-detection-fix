@@ -1,0 +1,21 @@
+#!/bin/bash
+# Steam launch option wrapper that shows a game as its official Discord app, for
+# games whose Discord entry has no executables to match on.
+# It waits for the game's process to appear, then attaches discord-presence to it.
+#
+# Launch options: steam-discord <client_id> <process name> %command%
+if [ $# -lt 3 ]; then
+    echo "usage: $(basename "$0") <client_id> <process name> <command> [args...]" >&2
+    exit 2
+fi
+here=$(dirname "$(readlink -f "$0")")
+client_id=$1
+name=${2:0:15}
+shift 2
+(
+    for i in $(seq 180); do
+        pid=$(pgrep -nx "$name") && exec "$here/discord-presence" "$client_id" "$pid"
+        sleep 1
+    done
+) </dev/null >/dev/null 2>&1 &
+exec "$@"
